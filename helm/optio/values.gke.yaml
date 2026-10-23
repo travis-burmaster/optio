@@ -1,0 +1,114 @@
+# Optio on GKE with Cloud SQL, in-cluster Redis on a PVC, ingress-nginx and
+# cert-manager. Standalone values (adapted from values.production.yaml, which
+# assumes an external Redis). Put your hostname in a small file of your own:
+#
+#   publicUrl: https://optio.example.com
+#   ingress:
+#     hosts:
+#       - host: optio.example.com
+#         paths: [...same three paths as below...]
+#
+#   helm upgrade --install optio helm/optio -n optio --create-namespace \
+#     -f helm/optio/values.gke.yaml -f my-values.yaml
+#
+# Before installing, create the optio-runtime Secret (database-url,
+# encryption-key) and a cert-manager ClusterIssuer named letsencrypt-prod. For
+# Cloud SQL over private IP, a database-url with sslmode=require (encrypted,
+# server cert not verified) avoids shipping the instance's CA. ingress-nginx must allow snippet
+# annotations (allowSnippetAnnotations=true, annotations-risk-level=Critical):
+# the chart's Ingress uses one to keep /api/internal/* off the public listener.
+# scripts/gcp-poc.sh pauses and resumes the deployment.
+
+publicUrl: https://optio.example.com
+
+existingSecrets:
+  DATABASE_URL: { name: optio-runtime, key: database-url }
+  OPTIO_ENCRYPTION_KEY: { name: optio-runtime, key: encryption-key }
+
+# --- API Server ---
+api:
+  image:
+    tag: "0.19.2"
+  replicas: 1
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+  strategy:
+    type: Recreate
+  pdb:
+    enabled: true
+    maxUnavailable: 1
+  autoscaling:
+    enabled: false
+
+# --- Web UI ---
+web:
+  image:
+    tag: "0.19.2"
+  resources:
+    requests:
+      cpu: 200m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+# --- Agent pod isolation ---
+networkPolicy:
+  enabled: true
+
+# Cloud SQL (managed) for state; Redis in-cluster with an append-only file on a
+# PVC so queued work survives the node pool scaling to zero over weekends.
+postgresql:
+  enabled: false
+redis:
+  enabled: true
+  persistence:
+    enabled: true
+    storageClass: standard-rwo
+    size: 1Gi
+
+# --- Authentication ---
+auth:
+  disabled: false
+
+# --- Ingress with TLS (ingress-nginx on the reserved IP, cert-manager) ---
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-body-size: 50m
+  certManager:
+    enabled: true
+    clusterIssuer: letsencrypt-prod
+  hosts:
+    - host: optio.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+          service: web
+        - path: /api
+          pathType: Prefix
+          service: api
+        - path: /ws
+          pathType: Prefix
+          service: api
+
+# Sized for a node pool of at most three e2-standard-4 nodes. The LimitRange
+# (resourceQuota.limitRange, on by default) gives repo pods the requests and
+# limits the quota requires.
+resourceQuota:
+  enabled: true
+  hard:
+    requests.cpu: "10"
+    requests.memory: 36Gi
+    limits.cpu: "20"
+    limits.memory: 44Gi
+    pods: "30"
+    persistentvolumeclaims: "20"
