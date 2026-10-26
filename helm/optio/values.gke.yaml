@@ -28,7 +28,7 @@ existingSecrets:
 # --- API Server ---
 api:
   image:
-    tag: "0.19.2"
+    tag: "0.20.0"
   replicas: 1
   resources:
     requests:
@@ -48,7 +48,7 @@ api:
 # --- Web UI ---
 web:
   image:
-    tag: "0.19.2"
+    tag: "0.20.0"
   resources:
     requests:
       cpu: 200m
