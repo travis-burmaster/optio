@@ -49,6 +49,18 @@ gc() {
   fi
 }
 
+# Sum of the node pool's managed instance group target sizes.
+pool_target_size() {
+  local url total=0 n
+  for url in $(gcloud container node-pools describe "$POOL" --cluster "$CLUSTER" --zone "$ZONE" \
+    --format='value(instanceGroupUrls)' 2>/dev/null | tr ';' ' '); do
+    n="$(gcloud compute instance-groups managed describe "${url##*/}" --zone "$ZONE" \
+      --format='value(targetSize)' 2>/dev/null)"
+    total=$((total + ${n:-0}))
+  done
+  echo "$total"
+}
+
 kube_creds() {
   gcloud container clusters get-credentials "$CLUSTER" --zone "$ZONE" >/dev/null 2>&1
 }
@@ -72,7 +84,20 @@ down() {
   # kube-system) make the autoscaler bring a node straight back.
   log "Disabling autoscaling and scaling $POOL to 0 nodes"
   gc container node-pools update "$POOL" --cluster "$CLUSTER" --zone "$ZONE" --no-enable-autoscaling --quiet
-  gc container clusters resize "$CLUSTER" --node-pool "$POOL" --zone "$ZONE" --num-nodes 0 --quiet
+  # A resize issued right after the autoscaling change has twice finished with
+  # a replacement node (target size 1), so check the instance groups and retry.
+  local attempt size
+  for attempt in 1 2 3; do
+    gc container clusters resize "$CLUSTER" --node-pool "$POOL" --zone "$ZONE" --num-nodes 0 --quiet
+    sleep 20
+    size="$(pool_target_size)"
+    [[ "$size" == 0 ]] && break
+    echo "Node pool still targets $size node(s) after resize $attempt; retrying"
+  done
+  if [[ "$size" != 0 ]]; then
+    echo "Node pool did not reach 0 nodes; check: gcloud compute instance-groups managed list" >&2
+    return 1
+  fi
 
   log "Stopping Cloud SQL ($SQL_INSTANCE)"
   gc sql instances patch "$SQL_INSTANCE" --activation-policy=NEVER --quiet
@@ -91,6 +116,13 @@ up() {
 
   kube_creds
   log "Waiting for a node to be Ready"
+  # The resize can return before the new node registers, and `kubectl wait`
+  # fails outright ("no matching resources found") when there are no nodes.
+  local i
+  for i in $(seq 1 60); do
+    [[ -n "$(kubectl get nodes --no-headers 2>/dev/null)" ]] && break
+    sleep 10
+  done
   kubectl wait --for=condition=Ready node --all --timeout=600s
 
   log "Starting Redis, then Optio API/web"
